@@ -1,5 +1,8 @@
 .git
 .jj
+
 README.md
 LICENSE
+
 fly.toml
+vm-*.toml

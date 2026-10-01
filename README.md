@@ -4,18 +4,20 @@ Run a Linux VM as a Fly Machine.
 
 ## Setup
 
-First, customize the app name, machine size, and exposed ports in `fly.toml`. Deploy with:
+Copy `fly.toml` to `vm-<your-vm-name>.toml`. Customize the app name, machine size, and exposed ports. Deploy with:
 
 ```sh
+VM_NAME="<your-vm-name>"
+
 # Adjust region and size below. The machine will run in whatever region the
 # volume is pinned to.
-fly volumes create data --region iad --size 100
-fly deploy --ha=false
+fly volumes create data -c "vm-$VM_NAME.toml" --region iad --size 100
+fly deploy -c "vm-$VM_NAME.toml" --ha=false
 ```
 
 Get a root shell with `fly ssh console --pty -C guest`. I highly recommend installing and configuring an SSH server for easier access.
 
-Exposed ports must be defined in `fly.toml`. Re-deploy to apply changes. To SSH or use any other non-HTTP ports over IPv4, set up a dedicated IP with `fly ips allocate-v4`. See [the docs](https://docs.fly.io/networking/services#dedicated-ipv4) for more information.
+Exposed ports must be defined in `vm-*.toml`. Re-deploy to apply changes. To SSH or use any other non-HTTP ports over IPv4, set up a dedicated IP with `fly ips allocate-v4`. See [the docs](https://docs.fly.io/networking/services#dedicated-ipv4) for more information.
 
 #### License
 
