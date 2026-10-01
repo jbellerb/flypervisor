@@ -20,7 +20,13 @@ case "$SSH_ORIGINAL_COMMAND" in
 "")
     if test -t 0
     then
-        exec "$@" login -f root
+        # this is a pretty gross hack. login vhangup()s the pty provided by
+        # lxc-attach, closes its fds, and reopens the pty itself. lxc-attach
+        # sometimes notices the brief period where nothing holds the pty open
+        # and drops the session. Use fd 3 to keep it open until login exits,
+        # and catch any SIGHUPs.
+        exec "$@" /bin/sh \
+            -c 'trap : HUP; exec 3<&0; login -f root 3<&-; exit $?'
     fi
     exec "$@" su -l
     ;;
