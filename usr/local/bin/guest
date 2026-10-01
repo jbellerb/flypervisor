@@ -1,8 +1,8 @@
 #!/bin/sh
 
-if ! lxc-info -n dom0 -s 2> /dev/null | grep -q RUNNING
+if ! lxc-info -n guest -s 2> /dev/null | grep -q RUNNING
 then
-    echo "dom0 is not running" >&2
+    echo "guest is not running" >&2
     exit 1
 fi
 
@@ -10,7 +10,7 @@ fi
 cd "$HOME" 2> /dev/null || cd /
 
 attach() {
-    exec lxc-attach -n dom0 --clear-env \
+    exec lxc-attach -n guest --clear-env \
         --set-var TERM="${TERM:-xterm}" \
         --set-var HOME=/root \
         --set-var LANG="${LANG:-C.UTF-8}" \

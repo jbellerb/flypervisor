@@ -1,8 +1,8 @@
 #!/bin/sh
 
 ROOTFS=/data/rootfs
-DOM0_HOSTNAME="${FLY_APP_NAME:+$FLY_APP_NAME.fly.dev}"
-DOM0_HOSTNAME="${DOM0_HOSTNAME:-dom0}"
+GUEST_HOSTNAME="${FLY_APP_NAME:+$FLY_APP_NAME.fly.dev}"
+GUEST_HOSTNAME="${GUEST_HOSTNAME:-guest}"
 
 # bootstrap the lxc container
 if ! test -f "$ROOTFS/etc/os-release"
@@ -12,7 +12,7 @@ then
         --dist "${DIST:-ubuntu}" --release "${RELEASE:-resolute}" --arch amd64 \
         --variant default || exit 1
     rm -rf /var/lib/lxc/bootstrap
-    echo "$DOM0_HOSTNAME" > "$ROOTFS/etc/hostname"
+    echo "$GUEST_HOSTNAME" > "$ROOTFS/etc/hostname"
 fi
 
 # set up the bridge network
@@ -29,9 +29,9 @@ echo 2 > /proc/sys/net/ipv6/conf/eth0/accept_ra
 echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 
 nft -f - << EOF || exit 1
-table inet dom0
-delete table inet dom0
-table inet dom0 {
+table inet guest
+delete table inet guest
+table inet guest {
     chain prerouting {
         type nat hook prerouting priority dstnat;
         iifname "eth0" meta nfproto ipv4 tcp dport 22 dnat ip to 10.0.3.2
@@ -70,11 +70,11 @@ dnsmasq --interface=br0 --bind-interfaces --no-resolv --no-hosts \
     --enable-ra --dhcp-leasefile=/run/dnsmasq.leases || exit 1
 
 sh -c 'echo $$ > /sys/fs/cgroup/lxc/cgroup.procs 2> /dev/null
-    exec lxc-start -n dom0 -d -l INFO -o /dev/stderr "$@"' - \
-    -s lxc.uts.name="$DOM0_HOSTNAME" || exit 1
-lxc-wait -n dom0 -s RUNNING -t 30 || exit 1
+    exec lxc-start -n guest -d -l INFO -o /dev/stderr "$@"' - \
+    -s lxc.uts.name="$GUEST_HOSTNAME" || exit 1
+lxc-wait -n guest -s RUNNING -t 30 || exit 1
 
-trap 'lxc-stop -n dom0 -t 8' TERM INT
+trap 'lxc-stop -n guest -t 8' TERM INT
 
-lxc-wait -n dom0 -s STOPPED &
+lxc-wait -n guest -s STOPPED &
 wait $! || true

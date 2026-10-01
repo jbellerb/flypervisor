@@ -1,6 +1,6 @@
 lxc.include = /usr/share/lxc/config/common.conf
 lxc.arch = amd64
-lxc.uts.name = dom0
+lxc.uts.name = guest
 lxc.cgroup.relative = 1
 lxc.rootfs.path = dir:/data/rootfs
 lxc.net.0.type = veth
