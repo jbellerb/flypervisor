@@ -3,11 +3,7 @@ primary_region = 'iad'
 
 machine_config = '''{
   "containers": [
-    {
-      "name": "app",
-      "image": "placeholder",
-      "secrets": [{ "env_var": "BOOTSTRAP_SSH_PUBKEY" }]
-    }
+    { "name": "app", "image": "placeholder" }
   ]
 }'''
 container = 'app'

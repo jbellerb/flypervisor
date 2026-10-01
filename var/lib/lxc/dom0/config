@@ -10,4 +10,3 @@ lxc.net.0.name = eth0
 lxc.net.0.hwaddr = 00:16:3e:00:00:02
 lxc.apparmor.profile = unconfined
 lxc.pty.max = 64
-lxc.mount.entry = /data/ssh root/.ssh none bind,create=dir 0 0

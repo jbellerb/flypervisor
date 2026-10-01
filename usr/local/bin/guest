@@ -1,0 +1,35 @@
+#!/bin/sh
+
+if ! lxc-info -n dom0 -s 2> /dev/null | grep -q RUNNING
+then
+    echo "dom0 is not running" >&2
+    exit 1
+fi
+
+# lxc-attach keeps the cwd if the same path exists inside the container
+cd "$HOME" 2> /dev/null || cd /
+
+attach() {
+    exec lxc-attach -n dom0 --clear-env \
+        --set-var TERM="${TERM:-xterm}" \
+        --set-var HOME=/root \
+        --set-var LANG="${LANG:-C.UTF-8}" \
+        --set-var PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        -- "$@"
+}
+
+if test $# -gt 0
+then
+    attach "$@"
+fi
+
+if test -t 0
+then
+    # this is a pretty gross hack. login vhangup()s the pty provided by
+    # lxc-attach, closes its fds, and reopens the pty itself. lxc-attach
+    # sometimes notices the brief period where nothing holds the pty open and
+    # drops the session. Use fd 3 to keep it open until login exits, and catch
+    # any SIGHUPs.
+    attach /bin/sh -c 'trap : HUP; exec 3<&0; login -f root 3<&-; exit $?'
+fi
+attach su -l

@@ -1,28 +1,8 @@
 #!/bin/sh
 
 ROOTFS=/data/rootfs
-SSHDIR=/data/ssh
-HOSTKEYDIR=/data/sshd
 DOM0_HOSTNAME="${FLY_APP_NAME:+$FLY_APP_NAME.fly.dev}"
 DOM0_HOSTNAME="${DOM0_HOSTNAME:-dom0}"
-
-mkdir -p -m 700 "$SSHDIR" "$HOSTKEYDIR"
-
-if ! test -f "$SSHDIR/authorized_keys"
-then
-    if test -z "$BOOTSTRAP_SSH_PUBKEY"
-    then
-        echo "error: pass your public key as a secret named BOOTSTRAP_SSH_PUBKEY" >&2
-        exit 1
-    fi
-    echo "$BOOTSTRAP_SSH_PUBKEY" > "$SSHDIR/authorized_keys"
-    chmod 600 "$SSHDIR/authorized_keys"
-fi
-
-if ! test -f "$HOSTKEYDIR/ssh_host_ed25519_key"
-then
-    ssh-keygen -q -t ed25519 -N '' -f "$HOSTKEYDIR/ssh_host_ed25519_key" || exit 1
-fi
 
 # bootstrap the lxc container
 if ! test -f "$ROOTFS/etc/os-release"
@@ -52,6 +32,10 @@ nft -f - << EOF || exit 1
 table inet dom0
 delete table inet dom0
 table inet dom0 {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        iifname "eth0" meta nfproto ipv4 tcp dport 22 dnat ip to 10.0.3.2
+    }
     chain postrouting {
         type nat hook postrouting priority srcnat;
         ip saddr 10.0.3.0/24 oifname "eth0" masquerade
@@ -90,12 +74,7 @@ sh -c 'echo $$ > /sys/fs/cgroup/lxc/cgroup.procs 2> /dev/null
     -s lxc.uts.name="$DOM0_HOSTNAME" || exit 1
 lxc-wait -n dom0 -s RUNNING -t 30 || exit 1
 
-/usr/sbin/sshd -D -e &
-SSHD=$!
-
-trap 'lxc-stop -n dom0 -t 8; kill $SSHD 2> /dev/null' TERM INT
+trap 'lxc-stop -n dom0 -t 8' TERM INT
 
 lxc-wait -n dom0 -s STOPPED &
 wait $! || true
-kill $SSHD 2> /dev/null || true
-wait $SSHD 2> /dev/null || true
