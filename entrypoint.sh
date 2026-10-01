@@ -3,6 +3,8 @@
 ROOTFS=/data/rootfs
 SSHDIR=/data/ssh
 HOSTKEYDIR=/data/sshd
+DOM0_HOSTNAME="${FLY_APP_NAME:+$FLY_APP_NAME.fly.dev}"
+DOM0_HOSTNAME="${DOM0_HOSTNAME:-dom0}"
 
 mkdir -p -m 700 "$SSHDIR" "$HOSTKEYDIR"
 
@@ -30,7 +32,7 @@ then
         --dist "${DIST:-ubuntu}" --release "${RELEASE:-resolute}" --arch amd64 \
         --variant default || exit 1
     rm -rf /var/lib/lxc/bootstrap
-    echo dom0 > "$ROOTFS/etc/hostname"
+    echo "$DOM0_HOSTNAME" > "$ROOTFS/etc/hostname"
 fi
 
 # set up the bridge network
@@ -69,7 +71,7 @@ then
     mkdir -p /sys/fs/cgroup/init
     for p in $(cat /sys/fs/cgroup/cgroup.procs)
     do
-        echo "$p" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+        echo "$p" > /sys/fs/cgroup/init/cgroup.procs 2> /dev/null || true
     done
     sed -e 's/ / +/g' -e 's/^/+/' /sys/fs/cgroup/cgroup.controllers \
         > /sys/fs/cgroup/cgroup.subtree_control
@@ -84,7 +86,8 @@ dnsmasq --interface=br0 --bind-interfaces --no-resolv --no-hosts \
     --enable-ra --dhcp-leasefile=/run/dnsmasq.leases || exit 1
 
 sh -c 'echo $$ > /sys/fs/cgroup/lxc/cgroup.procs 2> /dev/null
-    exec lxc-start -n dom0 -d -l INFO -o /dev/stderr' || exit 1
+    exec lxc-start -n dom0 -d -l INFO -o /dev/stderr "$@"' - \
+    -s lxc.uts.name="$DOM0_HOSTNAME" || exit 1
 lxc-wait -n dom0 -s RUNNING -t 30 || exit 1
 
 /usr/sbin/sshd -D -e &
