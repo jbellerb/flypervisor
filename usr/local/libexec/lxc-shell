@@ -17,7 +17,13 @@ set -- lxc-attach -n dom0 --clear-env \
     --
 
 case "$SSH_ORIGINAL_COMMAND" in
-"") exec "$@" su -l ;;
+"")
+    if test -t 0
+    then
+        exec "$@" login -f root
+    fi
+    exec "$@" su -l
+    ;;
 internal-sftp|*sftp-server*) exec "$@" /usr/lib/openssh/sftp-server ;;
 *) exec "$@" /bin/sh -c "$SSH_ORIGINAL_COMMAND" ;;
 esac
