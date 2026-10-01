@@ -4,14 +4,10 @@ Run a Linux VM as a Fly Machine.
 
 ## Setup
 
-Copy `fly.toml` to `vm-<your-vm-name>.toml`. Customize the app name, machine size, and exposed ports. Deploy with:
+Copy `fly.toml` to `vm-<your-vm-name>.toml`. Customize the app name, region, disk size, machine size, and exposed ports. Deploy with:
 
 ```sh
 VM_NAME="<your-vm-name>"
-
-# Adjust region and size below. The machine will run in whatever region the
-# volume is pinned to.
-fly volumes create data -c "vm-$VM_NAME.toml" --region iad --size 100
 fly deploy -c "vm-$VM_NAME.toml" --ha=false
 ```
 

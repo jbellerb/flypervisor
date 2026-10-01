@@ -11,6 +11,7 @@ kill_timeout = 15
 [mounts]
   source = 'data'
   destination = '/data'
+  initial_size = '100gb'
 
 [[services]]
   protocol = 'tcp'
