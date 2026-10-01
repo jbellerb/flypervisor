@@ -13,8 +13,6 @@ kill_timeout = 15
   DIST = 'ubuntu'
   RELEASE = 'resolute'
 
-[build]
-
 [mounts]
   source = 'data'
   destination = '/data'
@@ -24,11 +22,33 @@ kill_timeout = 15
   internal_port = 22
   auto_stop_machines = 'off'
   auto_start_machines = false
-  processes = ['app']
 
   [[services.ports]]
     port = 22
-    handlers = []
+
+# [[services]]
+#   protocol = 'tcp'
+#   internal_port = 8080
+#   auto_stop_machines = 'off'
+#   auto_start_machines = false
+#
+#   [[services.ports]]
+#     port = 80
+#     handlers = ['http']
+#     force_https = true
+#
+#   [[services.ports]]
+#     port = 443
+#     handlers = ['tls', 'http']
+
+# [[services]]
+#   protocol = 'udp'
+#   internal_port = 53
+#   auto_stop_machines = 'off'
+#   auto_start_machines = false
+#
+#   [[services.ports]]
+#     port = 53
 
 [[vm]]
   cpu_kind = 'performance'

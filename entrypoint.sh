@@ -28,13 +28,20 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 echo 2 > /proc/sys/net/ipv6/conf/eth0/accept_ra
 echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 
+if test -n "$FLY_PRIVATE_IP"
+then
+    GUEST_6PN="
+        ip6 daddr $FLY_PRIVATE_IP tcp dport != 22 dnat ip6 to fd00:0:3::2
+        ip6 daddr $FLY_PRIVATE_IP meta l4proto udp dnat ip6 to fd00:0:3::2"
+fi
+
 nft -f - << EOF || exit 1
 table inet guest
 delete table inet guest
 table inet guest {
     chain prerouting {
         type nat hook prerouting priority dstnat;
-        iifname "eth0" meta nfproto ipv4 tcp dport 22 dnat ip to 10.0.3.2
+        iifname "eth0" meta nfproto ipv4 dnat ip to 10.0.3.2$GUEST_6PN
     }
     chain postrouting {
         type nat hook postrouting priority srcnat;
@@ -65,8 +72,8 @@ fi
 dnsmasq --interface=br0 --bind-interfaces --no-resolv --no-hosts \
     --server="$(sed -n '/^nameserver/ { s/^nameserver[[:space:]]*//p; q; }' /etc/resolv.conf)" \
     --dhcp-range=10.0.3.10,10.0.3.254,12h \
-    --dhcp-host=00:16:3e:00:00:02,10.0.3.2 \
-    --dhcp-range=::,constructor:br0,ra-stateless \
+    --dhcp-host=00:16:3e:00:00:02,10.0.3.2,[::2] \
+    --dhcp-range=::100,::1ff,constructor:br0,slaac,12h \
     --enable-ra --dhcp-leasefile=/run/dnsmasq.leases || exit 1
 
 sh -c 'echo $$ > /sys/fs/cgroup/lxc/cgroup.procs 2> /dev/null
