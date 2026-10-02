@@ -1,12 +1,7 @@
 app = 'flypervisor'
 primary_region = 'iad'
 
-machine_config = '''{
-  "containers": [
-    { "name": "app", "image": "placeholder" }
-  ]
-}'''
-container = 'app'
+machine_config = '{ "containers": [{ "name": "app" }] }'
 kill_timeout = 15
 
 [env]
