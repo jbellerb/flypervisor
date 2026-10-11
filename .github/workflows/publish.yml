@@ -1,0 +1,70 @@
+name: Publish image
+
+on:
+  push:
+    branches: [trunk]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILDER: build-${{ github.run_id }}-${{ github.run_attempt }}
+      BUILDKIT_IMAGE: moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin || {
+            echo "::error::failed to log in to GitHub Container Registry" >&2
+            exit 1
+          }
+
+      - name: Docker build and push
+        env:
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+          TAG: ghcr.io/${{ github.repository }}:latest
+        run: |
+          docker buildx create --name "$BUILDER" --driver docker-container \
+              --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap || {
+            echo "::error::failed to create buildx builder" >&2
+            exit 1
+          }
+
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) || {
+            echo "::error::failed to read commit timestamp" >&2
+            exit 1
+          }
+
+          docker buildx build --builder "$BUILDER" . \
+              --platform linux/amd64 \
+              --provenance=false \
+              --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+              --label "org.opencontainers.image.source=$SOURCE" \
+              --label "org.opencontainers.image.revision=$REVISION" \
+              --tag "$TAG" \
+              --output type=registry,rewrite-timestamp=true || {
+            echo "::error::failed to build and push image" >&2
+            exit 1
+          }
+          echo "Built and pushed $TAG"
+
+      - name: Remove buildx builder
+        if: always()
+        run: docker buildx rm --force "$BUILDER" || true
