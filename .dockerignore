@@ -4,6 +4,7 @@
 
 README.md
 LICENSE
+bin/
 
 fly.toml
 vm-*.toml

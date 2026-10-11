@@ -13,14 +13,14 @@ kill_timeout = 15
   destination = '/data'
   initial_size = '100gb'
 
-[[services]]
-  protocol = 'tcp'
-  internal_port = 22
-  auto_stop_machines = 'off'
-  auto_start_machines = false
-
-  [[services.ports]]
-    port = 22
+# [[services]]
+#   protocol = 'tcp'
+#   internal_port = 2222
+#   auto_stop_machines = 'off'
+#   auto_start_machines = false
+#
+#   [[services.ports]]
+#     port = 22
 
 # [[services]]
 #   protocol = 'tcp'
@@ -48,5 +48,5 @@ kill_timeout = 15
 
 [[vm]]
   cpu_kind = 'performance'
-  cpus = 16
-  memory_mb = 65536
+  cpus = 4
+  memory_mb = 8192

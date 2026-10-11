@@ -1,0 +1,956 @@
+#!/usr/bin/env sh
+
+if test -z "$NO_COLOR"
+then
+    BOLD=$(printf "\033[1m")
+    RED=$(printf "\033[31m")
+    GREEN=$(printf "\033[32m")
+    YELLOW=$(printf "\033[33m")
+    PURPLE=$(printf "\033[35m")
+    RESET_COLOR=$(printf "\033[39m")
+    RESET=$(printf "\033[0m")
+fi
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flyperctl"
+IMAGE=${FLYPERCTL_IMAGE:-ghcr.io/jbellerb/flypervisor:latest}
+LXC_INDEX=https://images.linuxcontainers.org/meta/1.0/index-system
+
+# add a per-source exception for fly-proxy's internal IP. I've been locked out
+# in the past from failed bot logins getting all external connections
+# rate-limited. Forcing key authentication provides reasonable protection.
+OPENSSH_SNIPPET='echo "Port 2222" > /etc/ssh/sshd_config.d/10-6pn.conf
+printf "PasswordAuthentication no\nKbdInteractiveAuthentication no\n" > /etc/ssh/sshd_config.d/99-auth.conf
+echo "PerSourcePenaltyExemptList 172.16.0.0/12,fdaa::/16" > /etc/ssh/sshd_config.d/20-fly-proxy.conf
+mkdir -p -m 700 "/home/$user/.ssh"
+touch "/home/$user/.ssh/authorized_keys"
+chown "$user:$user" "/home/$user/.ssh" "/home/$user/.ssh/authorized_keys"
+chmod 600 "/home/$user/.ssh/authorized_keys"
+sshd -t'
+
+AUTHORIZED_KEYS_SNIPPET='sort -u -o "/home/$user/.ssh/authorized_keys" "/home/$user/.ssh/authorized_keys" - << '\''KEYS'\'''
+
+UBUNTU_RESOLUTE_SSH_SCRIPT="set -e
+export DEBIAN_FRONTEND=noninteractive
+id \"\$user\" > /dev/null
+if ! test -f /usr/sbin/sshd
+then
+    apt-get update -qq
+    apt-get install -y -qq openssh-server > /dev/null
+fi
+$OPENSSH_SNIPPET
+systemctl daemon-reload
+systemctl stop ssh.service
+systemctl restart ssh.socket
+$AUTHORIZED_KEYS_SNIPPET"
+
+DEBIAN_TRIXIE_SSH_SCRIPT="set -e
+export DEBIAN_FRONTEND=noninteractive
+if ! test -f /usr/sbin/sshd || ! test -f /usr/bin/sudo
+then
+    apt-get update -qq
+    apt-get install -y -qq openssh-server sudo > /dev/null
+fi
+id \"\$user\" > /dev/null 2>&1 || useradd -m -s /bin/bash -G sudo \"\$user\"
+echo \"\$user ALL=(ALL) NOPASSWD:ALL\" > \"/etc/sudoers.d/90-\$user\"
+chmod 440 \"/etc/sudoers.d/90-\$user\"
+$OPENSSH_SNIPPET
+systemctl restart ssh.service
+$AUTHORIZED_KEYS_SNIPPET"
+
+ALPINE_3_24_SSH_SCRIPT="set -e
+if ! test -f /usr/sbin/sshd || ! test -f /usr/bin/doas
+then
+    apk add -q --no-cache openssh-server doas
+fi
+if ! id \"\$user\" > /dev/null 2>&1
+then
+    adduser -D \"\$user\"
+    addgroup \"\$user\" wheel
+    echo \"\$user:*\" | chpasswd -e > /dev/null
+fi
+echo \"permit nopass :wheel\" > /etc/doas.d/wheel.conf
+mkdir -p /etc/ssh/sshd_config.d
+ssh-keygen -A > /dev/null
+$OPENSSH_SNIPPET
+rc-update add sshd default > /dev/null
+rc-service sshd restart > /dev/null
+$AUTHORIZED_KEYS_SNIPPET"
+
+exec 3>&1
+
+flyperctl_error() {
+    echo "${BOLD}${RED}Error:${RESET} ${BOLD}$1${RESET}" >&2
+    return 1
+}
+
+flyperctl_warning() {
+    echo "${BOLD}${YELLOW}Warning:${RESET} ${BOLD}$1${RESET}" >&2
+}
+
+flyperctl_unexpected_argument() {
+    cat >&2 << EOF
+$(flyperctl_error "Unexpected argument '${YELLOW}$1${RESET_COLOR}' found" 2>&1)
+
+$2
+
+For more information, try '${BOLD}${GREEN}--help${RESET}'.
+EOF
+    return 2
+}
+
+flyperctl_missing_name() {
+    cat >&2 << EOF
+$(flyperctl_error "Missing required argument '${YELLOW}<NAME>${RESET_COLOR}'" 2>&1)
+
+$1
+
+For more information, try '${BOLD}${GREEN}--help${RESET}'.
+EOF
+    return 2
+}
+
+flyperctl_missing_value() {
+    cat >&2 << EOF
+$(flyperctl_error "Missing value for '${YELLOW}$1${RESET_COLOR}'" 2>&1)
+
+$2
+
+For more information, try '${BOLD}${GREEN}--help${RESET}'.
+EOF
+    return 2
+}
+
+flyperctl_has_value() {
+    case "$3" in
+    ''|-*) flyperctl_missing_value "$2" "$1" ;;
+    esac
+}
+
+flyperctl_parse_name() {
+    command=$1
+    shift
+    name=
+
+    while test $# -gt 0
+    do
+        case "$1" in
+        --help|-h) flyperctl_${command}_usage; exit ;;
+        *)
+            if test -z "$name" && test "${1#-}" = "$1"
+            then
+                name=$1
+            else
+                flyperctl_unexpected_argument "$1" "$(flyperctl_${command}_usage_line)"
+                exit
+            fi
+            ;;
+        esac
+        shift
+    done
+
+    test -n "$name" || \
+        { flyperctl_missing_name "$(flyperctl_${command}_usage_line)"; exit; }
+}
+
+flyperctl_check_arg() {
+    case "$2" in
+    ''|*[!$3]*) flyperctl_error "Invalid $1 '${YELLOW}$2${RESET_COLOR}'"; return 2 ;;
+    esac
+}
+
+flyperctl_check_number() {
+    case "$2" in
+    ''|0*|*[!0-9]*) flyperctl_error "Invalid $1 '${YELLOW}$2${RESET_COLOR}'"; return 2 ;;
+    esac
+}
+
+flyperctl_config() {
+    echo "$CONFIG_DIR/$1.toml"
+}
+
+flyperctl_config_value() {
+    sed -n "s/^ *$2 = '\(.*\)'\$/\1/p" "$(flyperctl_config "$1")"
+}
+
+flyperctl_check_vm() {
+    test -f "$(flyperctl_config "$1")" || flyperctl_error "No VM named '$1'"
+}
+
+flyperctl_app_exists() {
+    fly status -a "$1" > /dev/null 2>&1
+}
+
+flyperctl_fly() {
+    stderr=$(mktemp) || return
+    if stdout=$(fly "$@" 2> "$stderr")
+    then
+        rm -f "$stderr"
+        echo "$stdout"
+    else
+        cat "$stderr"
+        rm -f "$stderr"
+        return 1
+    fi
+}
+
+flyperctl_machine() {
+    name=$1
+
+    machines=$(flyperctl_fly machines list -a "$name" --json) || {
+        case "$machines" in
+        *"app not found"*)
+            echo "$name hasn't been deployed (run '${GREEN}flyperctl setup $name${RESET_COLOR}' first)"
+            return 2
+            ;;
+        esac
+        echo "Failed to list machines for $name: $machines"
+        return 1
+    }
+    machine=$(echo "$machines" | jq -c '.[0] // empty')
+    test -n "$machine" || \
+        { echo "$name has no machines (did you run '${GREEN}flyperctl setup $name${RESET_COLOR}'?)"; return 2; }
+
+    echo "$machine"
+}
+
+flyperctl_machine_id() {
+    machine=$(flyperctl_machine "$1") || { echo "$machine"; return 1; }
+    echo "$machine" | jq -r '.id'
+}
+
+flyperctl_template() {
+    name=$1
+    region=$2
+    dist=$3
+    release=$4
+    disk=$5
+    cpus=$6
+    memory=$7
+    public=$8
+
+    services="[[services]]
+  protocol = 'tcp'
+  internal_port = 2222
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+
+  [[services.ports]]
+    port = 22"
+    test -n "$public" || services=$(echo "$services" | sed -e 's/^/# /' -e 's/^# $/#/')
+
+    cat << EOF
+app = '$name'
+primary_region = '$region'
+
+machine_config = '{ "containers": [{ "name": "app" }] }'
+kill_timeout = 15
+
+[build]
+  image = '$IMAGE'
+
+[env]
+  DIST = '$dist'
+  RELEASE = '$release'
+
+[mounts]
+  source = 'data'
+  destination = '/data'
+  initial_size = '${disk}gb'
+
+$services
+
+[[vm]]
+  cpu_kind = 'performance'
+  cpus = $cpus
+  memory_mb = $memory
+EOF
+}
+
+flyperctl_create_app() {
+    name=$1
+    network=$2
+
+    if ! flyperctl_app_exists "$name"
+    then
+        fly apps create "$name" ${network:+--network "$network"}
+    elif test -n "$network"
+    then
+        flyperctl_warning "$name already exists, so its network can't be changed"
+    fi
+}
+
+flyperctl_os() {
+    case "$1" in
+    ubuntu/resolute)
+        user=ubuntu
+        script=$UBUNTU_RESOLUTE_SSH_SCRIPT
+        ;;
+    debian/trixie)
+        user=debian
+        script=$DEBIAN_TRIXIE_SSH_SCRIPT
+        ;;
+    alpine/3.24|alpine/3.24.*)
+        user=alpine
+        script=$ALPINE_3_24_SSH_SCRIPT
+        ;;
+    *) return 1 ;;
+    esac
+}
+
+flyperctl_is_public() {
+    grep -q '^ *internal_port = 2222' "$(flyperctl_config "$1")"
+}
+
+flyperctl_public_ip() {
+    name=$1
+    type=$2
+
+    ips=$(flyperctl_fly ips list -a "$name" --json) || \
+        { echo "Failed to list IPs for $name: $ips"; return 1; }
+    echo "$ips" | jq -r --arg type "$type" \
+        'map(select(.Type == $type))[0].Address // empty'
+}
+
+flyperctl_deploy() {
+    name=$1
+
+    fly deploy "$CONFIG_DIR" -c "$(flyperctl_config "$name")" --ha=false
+}
+
+flyperctl_wait_for_guest() {
+    name=$1
+
+    echo "Waiting for $name's guest to start..." >&3
+    tries=0
+    until fly ssh console -a "$name" -C "guest true" > /dev/null 2>&1
+    do
+        tries=$(( tries + 1 ))
+        test "$tries" -lt 60 || \
+            { echo "Timed out waiting for $name's guest to start"; return 1; }
+        sleep 5
+    done
+}
+
+flyperctl_keys() {
+    key_file=$1
+
+    if test -n "$key_file"
+    then
+        keys=$(cat "$key_file" 2>&1) || \
+            { echo "Failed to read public keys: $keys"; return 1; }
+    else
+        keys=$(ssh-add -L 2>&1) || \
+            { echo "Failed to get public keys from ssh-agent: $keys
+
+Pass '${GREEN}--key${RESET_COLOR}' to use a key file."; return 1; }
+    fi
+    keys=$(echo "$keys" | grep -v -e '^[[:space:]]*$' -e '^#')
+    test -n "$keys" || { echo "No public keys found"; return 1; }
+
+    echo "$keys"
+}
+
+flyperctl_setup_ssh() {
+    name=$1
+    keys=$2
+
+    flyperctl_wait_for_guest "$name" || return
+    os=$(
+        flyperctl_fly ssh console -a "$name" \
+            -C "guest sh -c '. /etc/os-release && echo \$ID/\${VERSION_CODENAME:-\$VERSION_ID}'"
+    ) || { echo "Failed to detect $name's OS: $os"; return 1; }
+    os=$(echo "$os" | tr -d '\r')
+    flyperctl_os "$os" || {
+        echo "Couldn't set up SSH for unknown OS '$os'.
+
+Configure the machine with '${GREEN}fly ssh console -a $name --pty -C guest${RESET_COLOR}'"
+        return 1
+    }
+
+    echo "Configuring SSH for the $user user..." >&3
+    output=$(
+        printf 'user=%s\n%s\n%s\nKEYS\n' "$user" "$script" "$keys" | \
+            fly ssh console -a "$name" -C "guest sh -c 'cat | sh'" 2>&1
+    ) || { echo "Failed to configure SSH: $output"; return 1; }
+
+    echo "$user"
+}
+
+flyperctl_setup_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl setup${RESET} ${GREEN}[OPTIONS] <NAME>${RESET}"
+}
+
+flyperctl_setup_usage() {
+    cat << EOF
+Deploy a VM if needed and give its default user SSH access with your keys
+
+$(flyperctl_setup_usage_line)
+
+${BOLD}${YELLOW}Options:${RESET}
+  ${BOLD}${GREEN}-k${RESET}, ${BOLD}${GREEN}--key${RESET} ${GREEN}<FILE>${RESET}      A file of public keys to authorize [default: keys from ssh-agent]
+      ${BOLD}${GREEN}--network${RESET} ${GREEN}<NAME>${RESET}  The 6PN network to create the app in [default: default]
+EOF
+}
+
+flyperctl_setup() {
+    name=
+    key_file=
+    network=
+
+    while test $# -gt 0
+    do
+        case "$1" in
+        --key|-k)
+            flyperctl_has_value "$(flyperctl_setup_usage_line)" "$@" || return
+            shift
+            key_file=$1
+            ;;
+        --network)
+            flyperctl_has_value "$(flyperctl_setup_usage_line)" "$@" || return
+            shift
+            network=$1
+            ;;
+        --help|-h) flyperctl_setup_usage; return ;;
+        *)
+            if test -z "$name" && test "${1#-}" = "$1"
+            then
+                name=$1
+            else
+                flyperctl_unexpected_argument "$1" "$(flyperctl_setup_usage_line)"
+                return
+            fi
+            ;;
+        esac
+        shift
+    done
+
+    test -n "$name" || \
+        { flyperctl_missing_name "$(flyperctl_setup_usage_line)"; return; }
+    flyperctl_check_vm "$name" || return
+    test -z "$network" || flyperctl_check_arg network "$network" a-z0-9- || return
+    os="$(flyperctl_config_value "$name" DIST)/$(flyperctl_config_value "$name" RELEASE)"
+    flyperctl_os "$os" || \
+        flyperctl_error "Can't set up SSH for '${YELLOW}$os${RESET_COLOR}'" || return
+    keys=$(flyperctl_keys "$key_file") || flyperctl_error "$keys" || return
+
+    flyperctl_create_app "$name" "$network" || return
+    machine=$(flyperctl_machine "$name")
+    case $? in
+    0) ;;
+    2) flyperctl_deploy "$name" || return ;;
+    *) flyperctl_error "$machine" || return ;;
+    esac
+
+    user=$(flyperctl_setup_ssh "$name" "$keys") || \
+        flyperctl_error "$user" || return
+
+    machine=$(flyperctl_machine "$name") || flyperctl_error "$machine" || return
+    ip=$(echo "$machine" | jq -r '.private_ip')
+
+    v6=
+    v4=
+    if flyperctl_is_public "$name"
+    then
+        v6=$(flyperctl_public_ip "$name" v6) || flyperctl_error "$v6" || return
+        if test -z "$v6"
+        then
+            fly ips allocate-v6 -a "$name" > /dev/null || return
+            v6=$(flyperctl_public_ip "$name" v6) || flyperctl_error "$v6" || return
+        fi
+        v4=$(flyperctl_public_ip "$name" v4) || flyperctl_error "$v4" || return
+        if test -z "$v4" && test -t 0
+        then
+            echo
+            flyperctl_prompt "Allocate a dedicated IPv4 address for ${PURPLE}$name${RESET_COLOR}? [y/N]"
+            case "$answer" in
+            y|Y|yes|YES)
+                fly ips allocate-v4 -a "$name" -y > /dev/null || return
+                v4=$(flyperctl_public_ip "$name" v4) || flyperctl_error "$v4" || return
+                ;;
+            esac
+        fi
+    fi
+
+    cat << EOF
+
+$name is ready. Connect over 6PN with:
+
+    ${BOLD}${GREEN}ssh -p 2222 $user@$ip${RESET}
+EOF
+    test -n "$v6" || return 0
+    cat << EOF
+
+Or over the internet with:
+
+    ${BOLD}${GREEN}ssh $user@$v6${RESET}
+EOF
+    if test -n "$v4"
+    then
+        echo "    ${BOLD}${GREEN}ssh $user@$v4${RESET}"
+    else
+        cat << EOF
+
+To connect over IPv4, run '${BOLD}${GREEN}fly ips allocate-v4 -a $name${RESET}'.
+EOF
+    fi
+}
+
+flyperctl_create_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl create${RESET} ${GREEN}[OPTIONS] <NAME>${RESET}"
+}
+
+flyperctl_check_image() {
+    dist=$1
+    release=$2
+
+    index=$(curl -fsSL "$LXC_INDEX" 2>&1) || {
+        flyperctl_warning "Couldn't check for a $dist/$release image: $index"
+        return 0
+    }
+    case "
+$index" in
+    *"
+$dist;$release;amd64;default;"*) ;;
+    *) flyperctl_error "No '${YELLOW}$dist/$release${RESET_COLOR}' image on linuxcontainers.org" ;;
+    esac
+}
+
+flyperctl_prompt() {
+    printf "%s " "$1"
+    read -r answer
+}
+
+flyperctl_create_usage() {
+    cat << EOF
+Create a new VM config and set it up
+
+The VM's name is also used as its Fly App name.
+
+$(flyperctl_create_usage_line)
+
+${BOLD}${YELLOW}Options:${RESET}
+  ${BOLD}${GREEN}-r${RESET}, ${BOLD}${GREEN}--region${RESET} ${GREEN}<REGION>${RESET}  The region to run the VM in [default: iad]
+  ${BOLD}${GREEN}-k${RESET}, ${BOLD}${GREEN}--key${RESET} ${GREEN}<FILE>${RESET}       A file of public keys to authorize [default: keys from ssh-agent]
+      ${BOLD}${GREEN}--dist${RESET} ${GREEN}<DIST>${RESET}      The distribution to install [default: ubuntu]
+      ${BOLD}${GREEN}--release${RESET} ${GREEN}<NAME>${RESET}   The distribution release to install [default: resolute]
+      ${BOLD}${GREEN}--disk${RESET} ${GREEN}<GiB>${RESET}        The size of the data volume in GiB [default: 100]
+      ${BOLD}${GREEN}--cpus${RESET} ${GREEN}<N>${RESET}         The number of performance CPUs [default: 4]
+      ${BOLD}${GREEN}--memory${RESET} ${GREEN}<MB>${RESET}      The amount of memory in MB [default: 8192]
+      ${BOLD}${GREEN}--network${RESET} ${GREEN}<NAME>${RESET}   The 6PN network to create the app in [default: default]
+      ${BOLD}${GREEN}--public${RESET}           Expose SSH to the internet on port 22
+      ${BOLD}${GREEN}--no-deploy${RESET}        Only write the config, without deploying
+      ${BOLD}${GREEN}--skip-setup${RESET}       Deploy without configuring SSH
+  ${BOLD}${GREEN}-y${RESET}, ${BOLD}${GREEN}--yes${RESET}              Create without asking for confirmation
+EOF
+}
+
+flyperctl_create() {
+    name=
+    region=iad
+    key_file=
+    dist=ubuntu
+    release=
+    disk=100
+    cpus=4
+    memory=8192
+    network=
+    public=
+    no_deploy=
+    skip_setup=
+    yes=
+
+    while test $# -gt 0
+    do
+        case "$1" in
+        --region|-r)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            region=$1
+            ;;
+        --key|-k)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            key_file=$1
+            ;;
+        --dist)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            dist=$1
+            ;;
+        --release)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            release=$1
+            ;;
+        --disk)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            disk=$1
+            ;;
+        --cpus)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            cpus=$1
+            ;;
+        --memory)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            memory=$1
+            ;;
+        --network)
+            flyperctl_has_value "$(flyperctl_create_usage_line)" "$@" || return
+            shift
+            network=$1
+            ;;
+        --public) public=true ;;
+        --no-deploy) no_deploy=true ;;
+        --skip-setup) skip_setup=true ;;
+        --yes|-y) yes=true ;;
+        --help|-h) flyperctl_create_usage; return ;;
+        *)
+            if test -z "$name" && test "${1#-}" = "$1"
+            then
+                name=$1
+            else
+                flyperctl_unexpected_argument "$1" "$(flyperctl_create_usage_line)"
+                return
+            fi
+            ;;
+        esac
+        shift
+    done
+
+    test -n "$name" || \
+        { flyperctl_missing_name "$(flyperctl_create_usage_line)"; return; }
+    case "$name" in
+    *[!a-z0-9-]*)
+        flyperctl_error "VM names may only contain lowercase letters, digits, and dashes"
+        return 2
+        ;;
+    esac
+    flyperctl_check_arg region "$region" a-z || return
+    flyperctl_check_arg distribution "$dist" a-z0-9._- || return
+    if test -z "$release"
+    then
+        case "$dist" in
+        ubuntu) release=resolute ;;
+        debian) release=trixie ;;
+        alpine) release=3.24 ;;
+        *)
+            flyperctl_error "No default release for '${YELLOW}$dist${RESET_COLOR}'
+
+Pass '${GREEN}--release${RESET_COLOR}'."
+            return 2
+            ;;
+        esac
+    fi
+    flyperctl_check_arg release "$release" a-z0-9._- || return
+    flyperctl_check_number "disk size" "$disk" || return
+    flyperctl_check_number "CPU count" "$cpus" || return
+    flyperctl_check_number "memory size" "$memory" || return
+    test -z "$network" || flyperctl_check_arg network "$network" a-z0-9- || return
+
+    config=$(flyperctl_config "$name")
+    test ! -e "$config" || \
+        flyperctl_error "VM '${PURPLE}$name${RESET_COLOR}' already exists at '$config'" || return
+    test -n "$skip_setup" || flyperctl_os "$dist/$release" || {
+        flyperctl_error "Can't set up SSH for '${YELLOW}$dist/$release${RESET_COLOR}'
+
+Pass '${GREEN}--skip-setup${RESET_COLOR}' to create it anyway."
+        return 2
+    }
+    flyperctl_check_image "$dist" "$release" || return
+
+    mkdir -p "$CONFIG_DIR" || return
+    draft="$CONFIG_DIR/.$name.toml"
+    flyperctl_template "$name" "$region" "$dist" "$release" "$disk" \
+        "$cpus" "$memory" "$public" > "$draft" || return
+
+    if test -z "$yes"
+    then
+        cat << EOF
+${BOLD}Name:${RESET}    ${PURPLE}$name${RESET_COLOR}
+${BOLD}Region:${RESET}  $region
+${BOLD}OS:${RESET}      $dist/$release
+${BOLD}CPUs:${RESET}    $cpus (performance)
+${BOLD}Memory:${RESET}  $(jq -n --arg mb "$memory" '($mb | tonumber) / 1024') GiB
+${BOLD}Disk:${RESET}    $disk GiB
+${BOLD}Network:${RESET} ${network:-default}
+${BOLD}Public:${RESET}  ${public:-false}
+
+EOF
+        test -t 0 || \
+            flyperctl_error "Refusing to create without confirmation
+
+Pass '${GREEN}--yes${RESET_COLOR}' to skip it." || \
+            { rm -f "$draft"; return 1; }
+        flyperctl_prompt "Create ${PURPLE}$name${RESET_COLOR}? [y/N/e]" || \
+            { rm -f "$draft"; return 1; }
+        case "$answer" in
+        y|Y|yes|YES) ;;
+        e|E|edit|EDIT) ${EDITOR:-vi} "$draft" || { rm -f "$draft"; return 1; } ;;
+        *) rm -f "$draft"; return 1 ;;
+        esac
+    fi
+
+    mv "$draft" "$config" || return
+    echo "Created $config"
+
+    if test -n "$no_deploy"
+    then
+        echo "Run '${BOLD}${GREEN}flyperctl setup${network:+ --network $network} $name${RESET}' to deploy it."
+        return
+    fi
+
+    if test -n "$skip_setup"
+    then
+        flyperctl_create_app "$name" "$network" || return
+        flyperctl_deploy "$name"
+        return
+    fi
+
+    set -- "$name"
+    test -z "$network" || set -- --network "$network" "$@"
+    test -z "$key_file" || set -- --key "$key_file" "$@"
+    flyperctl_setup "$@"
+}
+
+flyperctl_update_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl update${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_update_usage() {
+    cat << EOF
+Redeploy a VM with its current config
+
+$(flyperctl_update_usage_line)
+EOF
+}
+
+flyperctl_update() {
+    flyperctl_parse_name update "$@"
+    flyperctl_check_vm "$name" || return
+    flyperctl_app_exists "$name" || \
+        flyperctl_error "$name hasn't been deployed (run '${GREEN}flyperctl setup $name${RESET_COLOR}' first)" || return
+
+    flyperctl_deploy "$name"
+}
+
+flyperctl_edit_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl edit${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_edit_usage() {
+    cat << EOF
+Edit a VM's config in \$EDITOR, then redeploy
+
+$(flyperctl_edit_usage_line)
+EOF
+}
+
+flyperctl_edit() {
+    flyperctl_parse_name edit "$@"
+    flyperctl_check_vm "$name" || return
+
+    config=$(flyperctl_config "$name")
+    before=$(cksum < "$config")
+    ${EDITOR:-vi} "$config" || return
+    if test "$(cksum < "$config")" = "$before"
+    then
+        echo "No changes to $name"
+        return
+    fi
+
+    if ! flyperctl_app_exists "$name"
+    then
+        echo "Run '${BOLD}${GREEN}flyperctl setup $name${RESET}' to deploy it."
+        return
+    fi
+    flyperctl_deploy "$name"
+}
+
+flyperctl_list_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl list${RESET}"
+}
+
+flyperctl_list_usage() {
+    cat << EOF
+List VMs and their states
+
+$(flyperctl_list_usage_line)
+EOF
+}
+
+flyperctl_list() {
+    while test $# -gt 0
+    do
+        case "$1" in
+        --help|-h) flyperctl_list_usage; return ;;
+        *)
+            flyperctl_unexpected_argument "$1" "$(flyperctl_list_usage_line)"
+            return
+            ;;
+        esac
+    done
+
+    printf "%-32s %-12s %s\n" NAME STATE REGION
+    for config in "$CONFIG_DIR"/*.toml
+    do
+        test -f "$config" || continue
+        name=$(basename "$config" .toml)
+        machine=$(flyperctl_machine "$name")
+        case $? in
+        0)
+            state=$(echo "$machine" | jq -r '.state')
+            region=$(echo "$machine" | jq -r '.region')
+            ;;
+        2)
+            state="not deployed"
+            region=$(flyperctl_config_value "$name" primary_region)
+            ;;
+        *)
+            flyperctl_warning "$machine"
+            state=unknown
+            region=$(flyperctl_config_value "$name" primary_region)
+            ;;
+        esac
+        printf "%-32s %-12s %s\n" "$name" "$state" "$region"
+    done
+}
+
+flyperctl_show_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl show${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_show_usage() {
+    cat << EOF
+Show a VM's state
+
+$(flyperctl_show_usage_line)
+EOF
+}
+
+flyperctl_show() {
+    flyperctl_parse_name show "$@"
+    flyperctl_check_vm "$name" || return
+
+    machine=$(flyperctl_machine "$name") || flyperctl_error "$machine" || return
+    public=
+    v6=
+    v4=
+    if flyperctl_is_public "$name"
+    then
+        public=true
+        v6=$(flyperctl_public_ip "$name" v6) || flyperctl_error "$v6" || return
+        v4=$(flyperctl_public_ip "$name" v4) || flyperctl_error "$v4" || return
+    fi
+    echo "$machine" | jq -r \
+        --arg name "$name" --arg config "$(flyperctl_config "$name")" \
+        --arg public "$public" --arg v6 "$v6" --arg v4 "$v4" \
+        --arg bold "$BOLD" --arg purple "$PURPLE" \
+        --arg reset_color "$RESET_COLOR" --arg reset "$RESET" '
+        "\($bold)Name:\($reset)     \($purple)\($name)\($reset_color)",
+        "\($bold)Machine:\($reset)  \(.id)",
+        "\($bold)State:\($reset)    \(.state)",
+        "\($bold)Region:\($reset)   \(.region)",
+        "\($bold)CPUs:\($reset)     \(.config.guest.cpus) (\(.config.guest.cpu_kind))",
+        "\($bold)Memory:\($reset)   \(.config.guest.memory_mb / 1024) GiB",
+        "\($bold)Disk:\($reset)     \(.config.mounts[0].size_gb // "none") GiB",
+        "\($bold)6PN IP:\($reset)   \(.private_ip)",
+        if $public != "" then
+            "\($bold)IPv6:\($reset)     \(if $v6 != "" then $v6 else "none" end)",
+            "\($bold)IPv4:\($reset)     \(if $v4 != "" then $v4 else "none" end)"
+        else empty end,
+        "\($bold)Config:\($reset)   \($config)"
+    '
+}
+
+flyperctl_machine_command() {
+    flyperctl_parse_name "$@"
+    flyperctl_check_vm "$name" || return
+
+    id=$(flyperctl_machine_id "$name") || flyperctl_error "$id" || return
+    case "$command" in
+    restart) fly machine restart "$id" -a "$name" ;;
+    *) fly machine "$command" "$id" -a "$name" ;;
+    esac
+}
+
+flyperctl_start_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl start${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_start_usage() {
+    cat << EOF
+Start a stopped VM
+
+$(flyperctl_start_usage_line)
+EOF
+}
+
+flyperctl_stop_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl stop${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_stop_usage() {
+    cat << EOF
+Stop a running VM
+
+$(flyperctl_stop_usage_line)
+EOF
+}
+
+flyperctl_restart_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl restart${RESET} ${GREEN}<NAME>${RESET}"
+}
+
+flyperctl_restart_usage() {
+    cat << EOF
+Restart a VM
+
+$(flyperctl_restart_usage_line)
+EOF
+}
+
+flyperctl_usage_line() {
+    echo "${BOLD}${YELLOW}Usage:${RESET} ${BOLD}${GREEN}flyperctl${RESET} ${GREEN}<COMMAND>${RESET}"
+}
+
+flyperctl_usage() {
+    cat << EOF
+Manage Linux VMs running as Fly Machines
+
+$(flyperctl_usage_line)
+
+${BOLD}${YELLOW}Commands:${RESET}
+  ${BOLD}${GREEN}create${RESET}   Create a new VM config and set it up
+  ${BOLD}${GREEN}setup${RESET}    Deploy a VM and configure SSH for its default user
+  ${BOLD}${GREEN}update${RESET}   Redeploy a VM with its current config
+  ${BOLD}${GREEN}edit${RESET}     Edit a VM's config, then redeploy
+  ${BOLD}${GREEN}list${RESET}     List VMs and their states
+  ${BOLD}${GREEN}show${RESET}     Show a VM's state
+  ${BOLD}${GREEN}start${RESET}    Start a stopped VM
+  ${BOLD}${GREEN}stop${RESET}     Stop a running VM
+  ${BOLD}${GREEN}restart${RESET}  Restart a VM
+
+VM configs are stored in ${PURPLE}$CONFIG_DIR${RESET_COLOR}.
+EOF
+}
+
+case "$1" in
+create) shift; flyperctl_create "$@" ;;
+setup) shift; flyperctl_setup "$@" ;;
+update) shift; flyperctl_update "$@" ;;
+edit) shift; flyperctl_edit "$@" ;;
+list|ls) shift; flyperctl_list "$@" ;;
+show) shift; flyperctl_show "$@" ;;
+start|stop|restart) flyperctl_machine_command "$@" ;;
+--help|-h) flyperctl_usage; exit ;;
+"") flyperctl_usage; exit 2 ;;
+*)
+    flyperctl_error "unknown command: '${YELLOW}$1${RESET_COLOR}'"
+    echo "" >&2
+    flyperctl_usage_line >&2
+    exit 2
+    ;;
+esac
