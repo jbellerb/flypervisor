@@ -47,8 +47,15 @@ jobs:
             exit 1
           }
 
-          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) || {
-            echo "::error::failed to read commit timestamp" >&2
+          BASE=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' Dockerfile | head -n 1)
+          BASE_CREATED=$(docker buildx imagetools inspect "$BASE" \
+              --format '{{json .Image}}' \
+              | jq -er '.["linux/amd64"].created') || {
+            echo "::error::failed to read base image creation time" >&2
+            exit 1
+          }
+          SOURCE_DATE_EPOCH=$(date -u -d "$BASE_CREATED" +%s) || {
+            echo "::error::failed to parse base image creation time" >&2
             exit 1
           }
 

@@ -20,7 +20,8 @@ printf '%s\n' \
     'Acquire::Snapshots::URI::Override::Label::Debian-Security "http://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/";' \
     > /etc/apt/apt.conf.d/50snapshot-http
 
-apt-get ${snapshot:+--snapshot "$snapshot"} update || exit
+apt-get ${snapshot:+--snapshot "$snapshot" \
+    -o Acquire::Check-Valid-Until=false} update || exit
 apt-get ${snapshot:+--snapshot "$snapshot"} install -y --no-install-recommends \
     ca-certificates dnsmasq-base gnupg iproute2 lxc nftables wget xz-utils \
     || exit
